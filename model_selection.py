@@ -1,0 +1,605 @@
+# Imports
+import numpy as np
+import scipy.fft as sp_fft
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from sklearn.preprocessing import StandardScaler
+from multiprocessing import Pool
+from tqdm import tqdm
+import pandas as pd
+import joblib
+import os
+import datetime
+
+#simulation configuration
+ETA   = 1.0   # shear viscosity      (AN)
+GAMMA = 1.0   # rotational viscosity (AN)
+
+AMH_CFG = dict(Ng=32, Nt=4000, dt=0.005, h=1.0, Nf=100)
+AN_CFG  = dict(Ng=32, Nt=4000, dt=0.005, h=1.0, Nf=100)
+
+N_FRAMES_AMH = 100    # frames used to build the AMH network's input image
+N_FRAMES_AN  = 100   # frames used to build the AN  network's input image
+
+EPS = 1e-16          # log10(E + EPS)
+
+# Sign convention: both k_tilde (AMH) and zeta (AN) are sampled/trained as
+# always-negative quantities but the networks predict log10(|value|).
+
+
+
+# 3. Simulators 
+class FPS_Numpy:
+    """Active Model H."""
+
+    def __init__(self, p):
+        self.Ng      = p['Ng']
+        self.Nt      = p['Nt']
+        self.dt      = np.float32(p['dt'])
+        self.h       = np.float32(p['h'])
+        self.a       = np.float32(p['a'])
+        self.b       = np.float32(p['b'])
+        self.kp      = np.float32(p['kp'])
+        self.k_tilde = np.float32(p['k_tilde'])
+        self.Nf      = p.get('Nf', 50)
+
+        q = (np.fft.fftfreq(self.Ng) * (2 * np.pi / self.h)).astype(np.float32)
+        self.qx, self.qy = np.meshgrid(q, q, indexing='ij')
+        self.q2 = (self.qx**2 + self.qy**2).astype(np.float32)
+
+        self.Dx = (1j * self.qx).astype(np.complex64)
+        self.Dy = (1j * self.qy).astype(np.complex64)
+
+        q2_safe  = np.where(self.q2 == 0, np.float32(1e-16), self.q2)
+        self.iq2 = np.where(
+            self.q2 > 0, np.float32(1) / q2_safe, np.float32(0)
+        ).astype(np.float32)
+
+        self.iQ2x = (self.qx * self.iq2).astype(np.float32)
+        self.iQ2y = (self.qy * self.iq2).astype(np.float32)
+
+        self.eA = np.exp(
+            -self.q2 * (self.a + self.kp * self.q2) * self.dt
+        ).astype(np.float32)
+
+        self.q2b = (self.q2 * self.b).astype(np.float32)
+
+    def flow(self, u_hat):
+        ux = sp_fft.ifft2(self.Dx * u_hat)
+        uy = sp_fft.ifft2(self.Dy * u_hat)
+
+        sxx = np.float32(0.5) * sp_fft.fft2(uy**2 - ux**2)
+        sxy =                  -sp_fft.fft2(ux * uy)
+
+        fqx = self.Dx * sxx + self.Dy * sxy
+        fqy = self.Dx * sxy - self.Dy * sxx
+
+        fac = fqx * self.iQ2x + fqy * self.iQ2y
+        vx  = sp_fft.ifft2(self.iq2 * fqx - fac * self.iQ2x)
+        vy  = sp_fft.ifft2(self.iq2 * fqy - fac * self.iQ2y)
+
+        return np.real(vx).astype(np.float32), np.real(vy).astype(np.float32)
+
+    def step(self, u_hat):
+        uc       = sp_fft.ifft2(u_hat)
+        vxg, vyg = self.flow(u_hat)
+        ux       = sp_fft.ifft2(self.Dx * u_hat)
+        uy       = sp_fft.ifft2(self.Dy * u_hat)
+
+        advection = -self.k_tilde * sp_fft.fft2(vxg * ux + vyg * uy)
+        nonlinear = -self.q2b     * sp_fft.fft2(uc**3)
+        N_hat     = advection + nonlinear
+
+        L          = -self.q2 * (self.a + self.kp * self.q2)
+        denom      = np.where(L == 0, np.float32(1.0), L)
+        propagator = np.where(L == 0, self.dt, (self.eA - np.float32(1)) / denom)
+        return u_hat * self.eA + N_hat * propagator
+
+    def run_full(self):
+        u = (0.2 * np.ones((self.Ng, self.Ng))
+             + np.float32(0.05) * np.random.randn(self.Ng, self.Ng)
+             ).astype(np.float32)
+        u_hat = sp_fft.fft2(u)
+
+        vx_ts, vy_ts, phi_ts = [], [], []
+
+        LATE_FRAC  = 0.8
+        start_step = int(self.Nt * LATE_FRAC)
+        late_steps = self.Nt - start_step
+        save_every = max(1, late_steps // self.Nf)
+
+        for i in range(self.Nt):
+            vxg, vyg = self.flow(u_hat)
+            if i >= start_step and (i - start_step) % save_every == 0:
+                vx_ts.append((vxg * self.k_tilde).astype(np.float32))
+                vy_ts.append((vyg * self.k_tilde).astype(np.float32))
+                phi_ts.append(np.real(sp_fft.ifft2(u_hat)).astype(np.float32))
+            u_hat = self.step(u_hat)
+
+        return (
+            np.array(vx_ts[:self.Nf],  dtype=np.float32),
+            np.array(vy_ts[:self.Nf],  dtype=np.float32),
+            np.array(phi_ts[:self.Nf], dtype=np.float32),
+        )
+
+
+class FPS_Nematic_Psi:
+    """Active Nematics"""
+
+    def __init__(self, p):
+        self.Ng    = p['Ng']
+        self.Nt    = p['Nt']
+        self.dt    = np.float32(p['dt'])
+        self.h     = np.float32(p.get('h', 1.0))
+        self.Nf    = p.get('Nf', 50)
+
+        kappa = np.float32(p['kappa'])
+        zeta  = np.float32(p['zeta'])
+        eta   = np.float32(p.get('eta', ETA))
+
+        self.kbe = kappa / (2.0 * eta)
+        self.zbe = zeta  / eta
+        self.kG  = kappa * GAMMA
+
+        fack = 2.0 * np.pi / self.h
+        kx   = (np.fft.fftfreq(self.Ng) * fack).astype(np.float32)
+        ky   = (np.fft.fftfreq(self.Ng) * fack).astype(np.float32)
+        self.kx, self.ky = np.meshgrid(kx, ky, indexing='ij')
+        self.kx2 = self.kx ** 2
+        self.ky2 = self.ky ** 2
+        self.ksq = (self.kx2 + self.ky2).astype(np.float32)
+
+        k4   = self.ksq ** 2
+        k4_s = np.where(k4 < 1e-6, np.float32(1e10), k4)
+        self.ik4 = (np.float32(1.0) / k4_s).astype(np.float32)
+        self.ik4[self.ksq == 0] = np.float32(0.0)
+
+        kmax_x = np.max(np.abs(self.kx))
+        kmax_y = np.max(np.abs(self.ky))
+        flt = np.ones((self.Ng, self.Ng), dtype=np.float32)
+        flt[np.abs(self.kx) > kmax_x * 2.0 / 3.0] = 0.0
+        flt[np.abs(self.ky) > kmax_y * 2.0 / 3.0] = 0.0
+        self.dAl = flt
+
+        self.L_theta = (-self.kG * self.ksq).astype(np.float32)
+        self.eA      = np.exp(self.L_theta * self.dt).astype(np.float32)
+
+    def _psi_hat(self, theta_hat, theta):
+        sin2t_hat = sp_fft.fft2(np.sin(2.0 * theta))
+        cos2t_hat = sp_fft.fft2(np.cos(2.0 * theta))
+
+        return (- self.kbe * theta_hat
+                + self.zbe * self.ik4
+                  * (np.float32(0.5) * (self.kx2 - self.ky2) * sin2t_hat
+                     - self.kx * self.ky * cos2t_hat))
+
+    def step(self, theta_hat):
+        theta = np.real(sp_fft.ifft2(theta_hat)).astype(np.float32)
+
+        psi_hat = self._psi_hat(theta_hat, theta)
+
+        c_x = np.real(sp_fft.ifft2(1j * self.kx * psi_hat)).astype(np.float32)
+        c_y = np.real(sp_fft.ifft2(1j * self.ky * psi_hat)).astype(np.float32)
+
+        u_x = np.real(sp_fft.ifft2(1j * self.kx * theta_hat)).astype(np.float32)
+        u_y = np.real(sp_fft.ifft2(1j * self.ky * theta_hat)).astype(np.float32)
+
+        advection = self.dAl * (c_x * u_y - c_y * u_x)
+        omega = np.real(sp_fft.ifft2(self.ksq * psi_hat)).astype(np.float32)
+
+        N     = advection + omega
+        N_hat = sp_fft.fft2(N)
+
+        denom      = np.where(self.L_theta == 0, np.float32(1.0), self.L_theta)
+        propagator = np.where(self.L_theta == 0, self.dt,
+                               (self.eA - np.float32(1.0)) / denom)
+
+        return theta_hat * self.eA + N_hat * propagator, psi_hat
+
+    def run_full(self):
+        theta     = (np.float32(0.05)
+                     * np.random.randn(self.Ng, self.Ng).astype(np.float32))
+        theta_hat = sp_fft.fft2(theta)
+
+        vx_ts, vy_ts, theta_ts = [], [], []
+
+        LATE_FRAC  = 0.8
+        start_step = int(self.Nt * LATE_FRAC)
+        late_steps = self.Nt - start_step
+        save_every = max(1, late_steps // self.Nf)
+
+        for i in range(self.Nt):
+            theta_hat, psi_hat = self.step(theta_hat)
+
+            if i >= start_step and (i - start_step) % save_every == 0:
+                vx = np.real(sp_fft.ifft2( 1j * self.ky * psi_hat)).astype(np.float32)
+                vy = np.real(sp_fft.ifft2(-1j * self.kx * psi_hat)).astype(np.float32)
+                theta_snap = np.real(sp_fft.ifft2(theta_hat)).astype(np.float32)
+                vx_ts.append(vx)
+                vy_ts.append(vy)
+                theta_ts.append(theta_snap)
+
+        return (
+            np.array(vx_ts[:self.Nf],    dtype=np.float32),
+            np.array(vy_ts[:self.Nf],    dtype=np.float32),
+            np.array(theta_ts[:self.Nf], dtype=np.float32),
+        )
+
+
+# feature extractors
+
+def _radial_bin_indices(Ng):
+    x = np.arange(Ng) - Ng // 2
+    X, Y = np.meshgrid(x, x)
+    r = np.sqrt(X**2 + Y**2).astype(int)
+    nr = np.bincount(r.ravel())
+    return r, nr
+
+
+def amh_net_features(vx_ts, vy_ts, n_frames=N_FRAMES_AMH):
+    """(1, n_frames, Ng//2) log-spectrum image, AMH network convention (bin-averaged, /nr)."""
+    Ng    = vx_ts.shape[1]
+    max_r = Ng // 2
+    r, nr = _radial_bin_indices(Ng)
+
+    indices = np.linspace(0, len(vx_ts) - 1, n_frames, dtype=int)
+    vx_sub, vy_sub = vx_ts[indices], vy_ts[indices]
+
+    spec_t = np.zeros((n_frames, max_r), dtype=np.float32)
+    for t in range(n_frames):
+        vxh = np.fft.fftshift(np.fft.fft2(vx_sub[t]))
+        vyh = np.fft.fftshift(np.fft.fft2(vy_sub[t]))
+        E   = np.float32(0.5) * (np.abs(vxh)**2 + np.abs(vyh)**2)
+        tbin = np.bincount(r.ravel(), E.ravel().astype(np.float64))
+        spec_t[t] = (tbin / nr)[:max_r].astype(np.float32)
+
+    return np.expand_dims(np.log10(spec_t + np.float32(EPS)), axis=0).astype(np.float32)
+
+
+def an_net_features(vx_ts, vy_ts, n_frames=N_FRAMES_AN):
+    """(1, n_frames, Ng//2) log-spectrum image, AN network convention (bin-averaged)."""
+    Ng    = vx_ts.shape[1]
+    max_r = Ng // 2
+    r, nr = _radial_bin_indices(Ng)
+
+    indices = np.linspace(0, len(vx_ts) - 1, n_frames, dtype=int)
+    vx_sub, vy_sub = vx_ts[indices], vy_ts[indices]
+
+    spec_t = np.zeros((n_frames, max_r), dtype=np.float32)
+    for t in range(n_frames):
+        vxh = np.fft.fftshift(np.fft.fft2(vx_sub[t]))
+        vyh = np.fft.fftshift(np.fft.fft2(vy_sub[t]))
+        E   = np.float32(0.5) * (np.abs(vxh)**2 + np.abs(vyh)**2)
+        tbin = np.bincount(r.ravel(), E.ravel().astype(np.float64))
+        spec_t[t] = (tbin / nr)[:max_r].astype(np.float32)
+
+    return np.expand_dims(np.log10(spec_t + np.float32(EPS)), axis=0).astype(np.float32)
+
+
+
+# energy spectrum extractor 
+
+
+def energy_time_avg_log_spectrum(vx_ts, vy_ts):
+    """
+    Uses every available saved frame (no subsampling) for the time average.
+    Returns
+    -------
+    log_E_k : (Ng//2,) float32 -- log10 of the TIME-AVERAGED radial spectrum
+    """
+    Ng    = vx_ts.shape[1]
+    max_r = Ng // 2
+    r, nr = _radial_bin_indices(Ng)
+
+    n_frames = vx_ts.shape[0]
+    E_kt = np.zeros((n_frames, max_r), dtype=np.float64)
+    for t in range(n_frames):
+        vxh = np.fft.fftshift(np.fft.fft2(vx_ts[t]))
+        vyh = np.fft.fftshift(np.fft.fft2(vy_ts[t]))
+        E   = 0.5 * (np.abs(vxh)**2 + np.abs(vyh)**2)
+        tbin = np.bincount(r.ravel(), E.ravel())
+        E_kt[t] = (tbin / nr)[:max_r]
+
+    E_k = E_kt.mean(axis=0)                 # <-- average over t FIRST (linear space)
+    return np.log10(E_k + EPS).astype(np.float32)   # <-- THEN take the log
+
+
+def compute_discrepancy(vx_obs, vy_obs, sim_fn, sim_args, R=5):
+    """
+    d_c = mean over R realizations of:
+            mean over k of  [ log Ehat_r(k) - log E_obs(k) ]^2
+
+    Returns (mu, sigma) over the R realizations.
+    """
+    log_E_obs_k = energy_time_avg_log_spectrum(vx_obs, vy_obs)
+
+    per_r = []
+    for _ in range(R):
+        vx_hat, vy_hat = sim_fn(*sim_args)
+        if vx_hat is None:
+            continue
+        log_E_hat_k = energy_time_avg_log_spectrum(vx_hat, vy_hat)
+
+        nk = min(len(log_E_obs_k), len(log_E_hat_k))
+        sq_err = (log_E_hat_k[:nk] - log_E_obs_k[:nk]) ** 2
+        per_r.append(sq_err.mean())          # average over k
+
+    per_r = np.asarray(per_r, dtype=np.float64)
+    if per_r.size == 0:
+        return np.inf, np.nan
+    return float(per_r.mean()), float(per_r.std())   # average over R
+
+
+
+# Network architectures
+
+
+class ActiveMatterNet2DNOET(nn.Module):
+    """AMH estimator. Output: [log10|k_tilde|, log10 b, log10 kappa_p]."""
+
+    def __init__(self, n_frames=N_FRAMES_AMH, n_bins=AMH_CFG['Ng'] // 2):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(5, 5), padding=2),
+            nn.LeakyReLU(0.1), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=(3, 3), padding=1),
+            nn.LeakyReLU(0.1), nn.MaxPool2d(2),
+            nn.Flatten(),
+        )
+        cnn_dim = 64 * (n_frames // 4) * (n_bins // 4)
+        self.fc = nn.Sequential(
+            nn.Linear(cnn_dim, 128), nn.LeakyReLU(0.1),
+            nn.Linear(128, 64),      nn.LeakyReLU(0.1),
+            nn.Linear(64, 3),
+        )
+
+    def forward(self, xc):
+        return self.fc(self.cnn(xc))
+
+
+class ActiveNematicNet(nn.Module):
+    """AN estimator. Output: [log10|zeta|, log10 kappa]."""
+
+    def __init__(self, n_frames=N_FRAMES_AN, n_bins=AN_CFG['Ng'] // 2):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(5, 5), padding=2),
+            nn.LeakyReLU(0.1), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=(3, 3), padding=1),
+            nn.LeakyReLU(0.1), nn.MaxPool2d(2),
+            nn.Flatten(),
+        )
+        cnn_dim = 64 * (n_frames // 4) * (n_bins // 4)
+        self.fc = nn.Sequential(
+            nn.Linear(cnn_dim, 128), nn.LeakyReLU(0.1),
+            nn.Linear(128, 64),      nn.LeakyReLU(0.1),
+            nn.Linear(64, 2),
+        )
+
+    def forward(self, xc):
+        return self.fc(self.cnn(xc))
+
+
+
+# Model loading + parameter prediction
+
+
+_amh_model = None
+_amh_scaler = None
+_an_model = None
+_an_scaler = None
+
+
+def load_models(amh_model_path, amh_scaler_path, an_model_path, an_scaler_path):
+    """
+    Load the two trained estimators once, e.g.:
+
+        load_models(
+            "amh_spatiotemporal_results_float32_400/model_XXXXXXXX_XXXXXX.pth",
+            "amh_spatiotemporal_results_float32_400/scaler_XXXXXXXX_XXXXXX.pkl",
+            "an_psi_results/model_XXXXXXXX_XXXXXX.pth",
+            "an_psi_results/scaler_XXXXXXXX_XXXXXX.pkl",
+        )
+    """
+    global _amh_model, _amh_scaler, _an_model, _an_scaler
+
+    _amh_model = ActiveMatterNet2DNOET()
+    _amh_model.load_state_dict(torch.load(amh_model_path, map_location='cpu'))
+    _amh_model.eval()
+    _amh_scaler = joblib.load(amh_scaler_path)
+
+    _an_model = ActiveNematicNet()
+    _an_model.load_state_dict(torch.load(an_model_path, map_location='cpu'))
+    _an_model.eval()
+    _an_scaler = joblib.load(an_scaler_path)
+
+
+def predict_amh_params(vx, vy):
+    """Predicts (k_tilde, b, kappa_p) for the AMH candidate."""
+    Xc = amh_net_features(vx, vy)
+    with torch.no_grad():
+        pred_scaled = _amh_model(torch.from_numpy(Xc).unsqueeze(0)).numpy()
+    pred = _amh_scaler.inverse_transform(pred_scaled)[0]
+    return dict(
+        k_tilde=-float(10 ** pred[0]),   # k_tilde is always negative
+        b=float(10 ** pred[1]),
+        kp=float(10 ** pred[2]),
+    )
+
+
+def predict_an_params(vx, vy):
+    """Predicts (kappa, zeta) for the AN candidate."""
+    Xc = an_net_features(vx, vy)
+    with torch.no_grad():
+        pred_scaled = _an_model(torch.from_numpy(Xc).unsqueeze(0)).numpy()
+    pred = _an_scaler.inverse_transform(pred_scaled)[0]
+    return dict(
+        zeta=-float(10 ** pred[0]),      # zeta is always negative (contractile)
+        kappa=float(10 ** pred[1]),
+    )
+
+
+
+# Resimulation wrappers
+
+
+def run_amh(k_tilde, kp, b):
+    p = dict(Ng=AMH_CFG['Ng'], Nt=AMH_CFG['Nt'], dt=AMH_CFG['dt'], h=AMH_CFG['h'],
+             a=-float(b), b=float(b), kp=float(kp), k_tilde=float(k_tilde),
+             Nf=AMH_CFG['Nf'])
+    vx, vy, phi = FPS_Numpy(p).run_full()
+    if not (np.isfinite(vx).all() and np.isfinite(vy).all()):
+        return None, None
+    return vx, vy
+
+
+def run_an(kappa, zeta):
+    p = dict(Ng=AN_CFG['Ng'], Nt=AN_CFG['Nt'], dt=AN_CFG['dt'], h=AN_CFG['h'],
+             kappa=float(kappa), zeta=float(zeta), eta=ETA, Nf=AN_CFG['Nf'])
+    vx, vy, theta = FPS_Nematic_Psi(p).run_full()
+    if not (np.isfinite(vx).all() and np.isfinite(vy).all()):
+        return None, None
+    return vx, vy
+
+
+
+# Model selection  (Algorithm 1)
+
+
+def select_model(vx_obs, vy_obs, R=5, verbose=True):
+    """
+    Returns the AMH/AN decision, confidence, scores, and the
+    predicted parameters for both candidates (k_tilde, b, kappa_p
+    for AMH; kappa, zeta for AN).
+    """
+    amh_p = predict_amh_params(vx_obs, vy_obs)
+    an_p  = predict_an_params(vx_obs, vy_obs)
+
+    candidates = {
+        'AMH': (run_amh, (amh_p['k_tilde'], amh_p['kp'], amh_p['b'])),
+        'AN':  (run_an,  (an_p['kappa'], an_p['zeta'])),
+    }
+
+    scores, stds = {}, {}
+    for name, (sim_fn, args) in candidates.items():
+        if verbose:
+            print(f'  Running {name} resimulations (R={R}) ...', end=' ', flush=True)
+        mu, sigma = compute_discrepancy(vx_obs, vy_obs, sim_fn, args, R=R)
+        scores[name] = mu
+        stds[name] = sigma
+        if verbose:
+            print(f'd = {mu:.4f} \u00b1 {sigma:.4f}')
+
+    d_arr  = np.array(list(scores.values()))
+    finite = np.isfinite(d_arr)
+    tau    = float(np.median(d_arr[finite])) if finite.any() else 1.0
+    tau    = max(tau, 1e-8)
+    w      = np.where(finite, np.exp(-d_arr / tau), 0.0)
+    w_sum  = w.sum()
+    conf   = {k: float(w[i] / w_sum) if w_sum > 0 else 0.0
+              for i, k in enumerate(scores)}
+
+    winner = min(scores, key=lambda k: scores[k])
+
+    return dict(
+        model=winner,
+        confidence=conf[winner],
+        scores=scores,
+        stds=stds,
+        conf=conf,
+        amh_params=amh_p,
+        an_params=an_p,
+    )
+
+
+def classify_velocity_field(vx, vy, R=5, verbose=True):
+    """Wrapper for a single unknown (vx, vy)."""
+    if verbose:
+        print('Running AMH vs AN model selection ...')
+    res = select_model(vx, vy, R=R, verbose=verbose)
+    print()
+    print(f'  Winner     : {res["model"]}')
+    print(f'  Confidence : {res["confidence"]*100:.1f}%')
+    print(f'  d_AMH = {res["scores"]["AMH"]:.5f}   d_AN = {res["scores"]["AN"]:.5f}')
+    if res['model'] == 'AMH':
+        p = res['amh_params']
+        print(f'  Best-fit AMH params: k_tilde={p["k_tilde"]:.4f}, '
+              f'b={p["b"]:.4f}, kappa_p={p["kp"]:.4f}')
+    else:
+        p = res['an_params']
+        print(f'  Best-fit AN params:  kappa={p["kappa"]:.4f}, zeta={p["zeta"]:.4f}')
+    return res
+
+
+
+# Batch evaluation over a stored results DataFrame
+
+
+def evaluate_dataframe(df, true_model_label, vx_col='vx', vy_col='vy',
+                        R=5, n_jobs=9, verbose=False):
+    """
+    Runs select_model on every row of df and reports accuracy, including
+    the predicted nuisance parameters for both candidates.
+    """
+    from joblib import Parallel, delayed
+    import pandas as pd
+
+    def _process_row(i, row):
+        vx = np.array(row[vx_col])
+        vy = np.array(row[vy_col])
+        res = select_model(vx, vy, R=R, verbose=verbose)
+        return dict(
+            true_model=true_model_label,
+            model_winner=res['model'],
+            correct=(res['model'] == true_model_label),
+            model_conf=res['confidence'],
+            d_AMH=res['scores']['AMH'],
+            d_AN=res['scores']['AN'],
+            c_AMH=res['conf']['AMH'],
+            c_AN=res['conf']['AN'],
+            score_ratio=(res['scores']['AMH'] / res['scores']['AN']
+                         if res['scores']['AN'] > 0 else np.inf),
+            k_tilde_pred=res['amh_params']['k_tilde'],
+            b_pred=res['amh_params']['b'],
+            kp_pred=res['amh_params']['kp'],
+            kappa_pred=res['an_params']['kappa'],
+            zeta_pred=res['an_params']['zeta'],
+        )
+
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_process_row)(i, row) for i, row in df.iterrows()
+    )
+    return pd.DataFrame(results)
+
+
+
+# Example usage
+
+
+if __name__ == "__main__":
+    # 1) Point these at your trained weights/scalers from amh.py / an.py:
+    load_models(
+        amh_model_path="amh_float32_32/model_20260705_152636.pth",
+        amh_scaler_path="amh_float32_32/scaler_20260705_152636.pkl",
+        an_model_path="an_psi_results/model_20260705_153631.pth",
+        an_scaler_path="an_psi_results/scaler_20260705_153631.pkl",
+    )
+
+    # 2) Classify an unknown field, vx/vy shape (Nf, Ng, Ng):
+    # result = classify_velocity_field(vx_unknown, vy_unknown, R=5)
+
+    # 3) Or batch-evaluate a stored DataFrame of known ground truth:
+    amh_df = pd.read_pickle('amh_float32_32/results_df_20260705_152636.pkl')
+    an_df  = pd.read_pickle('an_psi_results/results_df_20260705_153631.pkl')
+    amh_sel = evaluate_dataframe(amh_df, true_model_label='AMH')
+    an_sel  = evaluate_dataframe(an_df,  true_model_label='AN')
+    print(amh_sel.head())
+    print(an_sel.head())
+
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_selecction_results")
+    os.makedirs(output_dir, exist_ok=True)
+    amh_sel.to_pickle(os.path.join(output_dir, "amh.pkl"))
+    an_sel.to_pickle(os.path.join(output_dir, "an.pkl"))
+    pass
