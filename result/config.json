@@ -1,0 +1,27 @@
+{
+  "calibration": "/home/invisibleam/Documents/IITM/Research/AMH/amh_spectral/ml-fluidDynamics/float32_codex/700_res/calibration/model_selection_calibration.joblib",
+  "samples": 100,
+  "lambdas": [
+    -1.0,
+    -0.5,
+    0.5,
+    1.0
+  ],
+  "realizations": 5,
+  "seed": 20260928,
+  "output_dir": "/home/invisibleam/Documents/IITM/Research/AMH/amh_spectral/ml-fluidDynamics/float32_codex/700_res/calibrated_experiment_128_500",
+  "amh_model": "/home/invisibleam/Documents/IITM/Research/AMH/amh_spectral/ml-fluidDynamics/float32_codex/700_res/Test_700-20261006T065051Z-1-001/Test_700/amh/amh_spatiotemporal_results_float32/model_20260630_114902.pth",
+  "amh_scaler": "/home/invisibleam/Documents/IITM/Research/AMH/amh_spectral/ml-fluidDynamics/float32_codex/700_res/Test_700-20261006T065051Z-1-001/Test_700/amh/amh_spatiotemporal_results_float32/scaler_20260630_114902.pkl",
+  "an_model": "/home/invisibleam/Documents/IITM/Research/AMH/amh_spectral/ml-fluidDynamics/float32_codex/700_res/Test_700-20261006T065051Z-1-001/Test_700/an/an_psi_results/model_20260714_130331.pth",
+  "an_scaler": "/home/invisibleam/Documents/IITM/Research/AMH/amh_spectral/ml-fluidDynamics/float32_codex/700_res/Test_700-20261006T065051Z-1-001/Test_700/an/an_psi_results/scaler_20260714_130331.pkl",
+  "grid_size": 128,
+  "time_steps": 4000,
+  "dt": 0.005,
+  "grid_spacing": 1.0,
+  "saved_frames": 50,
+  "amh_network_frames": 50,
+  "an_network_frames": 50,
+  "amh_observation_time_steps": 5000,
+  "amh_k_tilde_min": -1.0,
+  "amh_k_tilde_max": -0.05
+}

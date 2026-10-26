@@ -1,0 +1,20 @@
+{
+  "logistic_slope": 6.7093610573318925,
+  "logistic_loo_accuracy": 0.9985714285714286,
+  "logistic_loo_brier": 0.001941321907388824,
+  "logistic_loo_log_loss": 0.008537953807392239,
+  "amh_adequacy_threshold": 5.284495162963867,
+  "an_adequacy_threshold": 1.272512435913086,
+  "amh_adequacy_loo_acceptance": 0.9914285714285714,
+  "an_adequacy_loo_acceptance": 0.9914285714285714,
+  "amh_k_tilde_factor": 1.1860511179569695,
+  "amh_k_tilde_loo_coverage": 0.9,
+  "amh_kp_factor": 1.0565412893245343,
+  "amh_kp_loo_coverage": 0.9,
+  "amh_b_factor": 1.0675144185255043,
+  "amh_b_loo_coverage": 0.9,
+  "an_kappa_factor": 1.1804077682214345,
+  "an_kappa_loo_coverage": 0.9,
+  "an_zeta_factor": 1.0784349526403487,
+  "an_zeta_loo_coverage": 0.9
+}
